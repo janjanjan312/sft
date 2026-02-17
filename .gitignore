@@ -1,0 +1,11 @@
+# Large artifacts (do not submit)
+artifacts/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.vscode/
+

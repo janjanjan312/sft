@@ -1,0 +1,10 @@
+# Minimal runtime deps for data prep + lm_eval scripts.
+# NOTE: For training, please install LLaMA-Factory separately (see README.md).
+
+datasets>=2.18.0
+transformers>=4.38.0
+accelerate>=0.28.0
+sentencepiece>=0.1.99
+tiktoken>=0.6.0
+lm_eval[hf]>=0.4.2
+

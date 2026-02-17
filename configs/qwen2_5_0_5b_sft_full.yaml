@@ -1,0 +1,53 @@
+# LLaMA-Factory SFT config (full finetuning) for Homework1
+#
+# Run:
+#   llamafactory-cli train configs/qwen2_5_0_5b_sft_full.yaml
+#
+# Before training, prepare dataset:
+#   python scripts/prepare_openorca_sft.py --max_samples 250000 --seed 42
+
+model_name_or_path: Qwen/Qwen2.5-0.5B
+
+stage: sft
+do_train: true
+
+# Full-parameter fine-tuning (homework requirement)
+finetuning_type: full
+
+# Use our cleaned dataset in artifacts/llamafactory_data/dataset_info.json
+dataset_dir: artifacts/llamafactory_data
+dataset: openorca_sft_clean
+
+# Qwen chat template
+template: qwen
+
+# Data processing
+cutoff_len: 2048        # if you have enough VRAM, you can try 4096
+preprocessing_num_workers: 8
+overwrite_cache: true
+
+# Output / logging
+output_dir: artifacts/saves/qwen2.5-0.5b/full/sft
+logging_steps: 10
+save_steps: 1000
+plot_loss: true
+overwrite_output_dir: true
+
+# Training hyperparameters (tune these in your report)
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+learning_rate: 5.0e-6
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.1
+max_grad_norm: 1.0
+seed: 42
+
+# Precision
+bf16: true              # set to false if your GPU doesn't support bf16
+fp16: false
+
+# DDP / stability
+ddp_timeout: 180000000
+
