@@ -20,7 +20,7 @@ import re
 import itertools
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 
 OPENORCA_REVISION = "e9c87b4"  # 2025-02-19 (pinned for reproducibility)
@@ -82,6 +82,7 @@ class CleaningStats:
     source_revision: str
     seen_rows: int = 0
     kept_rows: int = 0
+    selected_rows: int = 0
     dropped_empty: int = 0
     dropped_length: int = 0
     dropped_char_run: int = 0
@@ -134,6 +135,13 @@ def _dedup_key(question: str, response: str) -> bytes:
         "utf-8", errors="ignore"
     )
     return hashlib.sha1(payload).digest()
+
+
+def _score_from_key(seed: int, key: bytes) -> float:
+    # Stable pseudo-random score in [0, 1)
+    seed_bytes = seed.to_bytes(8, "big", signed=False)
+    digest = hashlib.sha1(seed_bytes + key).digest()
+    return int.from_bytes(digest, "big") / float(2**160)
 
 
 def iter_openorca_1m_subset() -> Iterable[Dict[str, Any]]:
@@ -217,6 +225,20 @@ def main() -> None:
         default=20_000,
         help="Print progress every N rows while scanning (0 to disable).",
     )
+    ap.add_argument(
+        "--dedup_selected",
+        action="store_true",
+        help="Deduplicate only among selected samples (low-memory).",
+    )
+    ap.add_argument(
+        "--hash_prob",
+        type=float,
+        default=None,
+        help=(
+            "Selection probability p in (0,1). If not set, use max_samples/1_000_000. "
+            "A sample is selected if hash_score < p."
+        ),
+    )
 
     # Cleaning thresholds
     ap.add_argument("--min_question_chars", type=int, default=10)
@@ -253,87 +275,92 @@ def main() -> None:
         source_rows_requested=OPENORCA_SUBSET_ROWS, source_revision=OPENORCA_REVISION
     )
 
-    # We do 2-phase:
-    # - filter + dedup while streaming
-    # - reservoir-like deterministic sampling via hashing (no need to hold all rows)
+    # Low-memory one-pass selection:
+    # - stream first 1M rows
+    # - apply cleaning filters
+    # - compute stable hash score; select if score < p
+    # - write selected samples to jsonl immediately
     #
-    # Approach:
-    # - assign each kept row a stable pseudo-random score based on (seed, dedup_key)
-    # - keep top-K by score using a small heap
-    import heapq
-
-    heap: list[Tuple[float, Dict[str, Any]]] = []
-    seen_keys: set[bytes] = set()
-
+    # This avoids keeping 250k full examples in RAM (Colab-friendly).
     t0 = time.monotonic()
     last_t = t0
 
-    for raw in iter_openorca_1m_subset():
-        stats.seen_rows += 1
-        try:
-            q = str(raw.get("question", "") or "")
-            r = str(raw.get("response", "") or "")
-            if not _is_valid_sample(q, r, cfg, stats):
-                continue
+    p = args.hash_prob
+    if p is None:
+        p = max(0.0, min(1.0, args.max_samples / float(OPENORCA_SUBSET_ROWS)))
+    if not (0.0 < p <= 1.0):
+        raise SystemExit(f"Invalid --hash_prob {p}, expected (0,1].")
 
-            key = _dedup_key(q, r)
-            if key in seen_keys:
-                stats.dropped_dedup += 1
-                continue
-            seen_keys.add(key)
-
-            alpaca = to_alpaca_jsonl_row(raw)
-
-            # Stable "random" score derived from key + seed (deterministic)
-            score_payload = args.seed.to_bytes(8, "big", signed=False) + key
-            score = int.from_bytes(hashlib.sha1(score_payload).digest(), "big") / float(2**160)
-
-            if len(heap) < args.max_samples:
-                heapq.heappush(heap, (score, alpaca))
-            else:
-                # keep larger scores (top-K)
-                if score > heap[0][0]:
-                    heapq.heapreplace(heap, (score, alpaca))
-        except Exception:
-            stats.dropped_other += 1
-            continue
-
-        if args.progress_every and stats.seen_rows % args.progress_every == 0:
-            now = time.monotonic()
-            dt = now - last_t
-            total_dt = now - t0
-            rows_per_s = args.progress_every / dt if dt > 0 else None
-            # Print a compact JSON line so `tail -f` is easy.
-            print(
-                json.dumps(
-                    {
-                        "progress": {
-                            "seen_rows": stats.seen_rows,
-                            "heap_size": len(heap),
-                            "dedup_size": len(seen_keys),
-                            "dropped_empty": stats.dropped_empty,
-                            "dropped_length": stats.dropped_length,
-                            "dropped_char_run": stats.dropped_char_run,
-                            "dropped_repetition": stats.dropped_repetition,
-                            "dropped_dedup": stats.dropped_dedup,
-                            "dropped_other": stats.dropped_other,
-                            "elapsed_min": round(total_dt / 60.0, 2),
-                            "rows_per_sec": None if rows_per_s is None else round(rows_per_s, 2),
-                        }
-                    },
-                    ensure_ascii=False,
-                )
-            )
-            last_t = now
-
-    # Finalize samples: sort by score descending for stable output
-    heap.sort(key=lambda x: x[0], reverse=True)
-    final_rows = [row for _, row in heap]
-
-    # Write main output (recommend putting it under dataset_dir)
+    # Ensure dirs exist early so you can monitor file growth during the run.
     os.makedirs(args.dataset_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.stats)), exist_ok=True)
     out_path = args.out
-    kept = write_jsonl(out_path, final_rows)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+
+    selected_keys: Optional[set[bytes]] = set() if args.dedup_selected else None
+
+    # Stream write output
+    kept = 0
+    with open(out_path, "w", encoding="utf-8") as out_f:
+        for raw in iter_openorca_1m_subset():
+            stats.seen_rows += 1
+            try:
+                q = str(raw.get("question", "") or "")
+                r = str(raw.get("response", "") or "")
+                if not _is_valid_sample(q, r, cfg, stats):
+                    continue
+
+                key = _dedup_key(q, r)
+
+                score = _score_from_key(args.seed, key)
+                if score >= p:
+                    continue
+
+                stats.selected_rows += 1
+                if selected_keys is not None:
+                    if key in selected_keys:
+                        stats.dropped_dedup += 1
+                        continue
+                    selected_keys.add(key)
+
+                alpaca = to_alpaca_jsonl_row(raw)
+                out_f.write(json.dumps(alpaca, ensure_ascii=False) + "\n")
+                kept += 1
+
+            except Exception:
+                stats.dropped_other += 1
+                continue
+
+            if args.progress_every and stats.seen_rows % args.progress_every == 0:
+                now = time.monotonic()
+                dt = now - last_t
+                total_dt = now - t0
+                rows_per_s = args.progress_every / dt if dt > 0 else None
+                print(
+                    json.dumps(
+                        {
+                            "progress": {
+                                "seen_rows": stats.seen_rows,
+                                "selected_rows": stats.selected_rows,
+                                "kept_rows": kept,
+                                "p": round(p, 6),
+                                "dropped_empty": stats.dropped_empty,
+                                "dropped_length": stats.dropped_length,
+                                "dropped_char_run": stats.dropped_char_run,
+                                "dropped_repetition": stats.dropped_repetition,
+                                "dropped_dedup": stats.dropped_dedup,
+                                "dropped_other": stats.dropped_other,
+                                "elapsed_min": round(total_dt / 60.0, 2),
+                                "rows_per_sec": None if rows_per_s is None else round(rows_per_s, 2),
+                            }
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                # ensure output file is visible growing
+                out_f.flush()
+                last_t = now
+
     stats.kept_rows = kept
 
     # Write dataset_info.json for LLaMA-Factory
@@ -368,7 +395,6 @@ def main() -> None:
         json.dump(dataset_info, f, ensure_ascii=False, indent=2)
 
     # Write stats
-    os.makedirs(os.path.dirname(os.path.abspath(args.stats)), exist_ok=True)
     with open(args.stats, "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -380,10 +406,19 @@ def main() -> None:
             indent=2,
         )
 
-    # Also write a small demo set (first 200 after sorting) for submission
-    demo_n = min(200, len(final_rows))
+    # Also write a small demo set for submission/reference (take first 200 lines)
     if args.demo_out:
-        write_jsonl(args.demo_out, final_rows[:demo_n])
+        os.makedirs(os.path.dirname(os.path.abspath(args.demo_out)), exist_ok=True)
+        demo_n = 200
+        written = 0
+        with open(out_path, "r", encoding="utf-8") as src_f, open(
+            args.demo_out, "w", encoding="utf-8"
+        ) as demo_f:
+            for line in src_f:
+                demo_f.write(line)
+                written += 1
+                if written >= demo_n:
+                    break
     if args.demo_dataset_info_out and args.demo_out:
         os.makedirs(os.path.dirname(os.path.abspath(args.demo_dataset_info_out)), exist_ok=True)
         demo_info = {
@@ -402,7 +437,21 @@ def main() -> None:
             json.dump(demo_info, f, ensure_ascii=False, indent=2)
 
     # Print a short summary (useful when redirecting to logs)
-    print(json.dumps({"kept_rows": kept, "seen_rows": stats.seen_rows}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "done": {
+                    "seen_rows": stats.seen_rows,
+                    "selected_rows": stats.selected_rows,
+                    "kept_rows": stats.kept_rows,
+                    "p": round(p, 6),
+                    "out": out_path,
+                    "stats": args.stats,
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
