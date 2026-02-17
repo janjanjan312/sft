@@ -18,6 +18,7 @@ import json
 import os
 import re
 import itertools
+import time
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, Tuple
 
@@ -210,6 +211,12 @@ def main() -> None:
         help="Final number of samples after filtering (suggested 200k~350k).",
     )
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--progress_every",
+        type=int,
+        default=20_000,
+        help="Print progress every N rows while scanning (0 to disable).",
+    )
 
     # Cleaning thresholds
     ap.add_argument("--min_question_chars", type=int, default=10)
@@ -258,6 +265,9 @@ def main() -> None:
     heap: list[Tuple[float, Dict[str, Any]]] = []
     seen_keys: set[bytes] = set()
 
+    t0 = time.monotonic()
+    last_t = t0
+
     for raw in iter_openorca_1m_subset():
         stats.seen_rows += 1
         try:
@@ -287,6 +297,34 @@ def main() -> None:
         except Exception:
             stats.dropped_other += 1
             continue
+
+        if args.progress_every and stats.seen_rows % args.progress_every == 0:
+            now = time.monotonic()
+            dt = now - last_t
+            total_dt = now - t0
+            rows_per_s = args.progress_every / dt if dt > 0 else None
+            # Print a compact JSON line so `tail -f` is easy.
+            print(
+                json.dumps(
+                    {
+                        "progress": {
+                            "seen_rows": stats.seen_rows,
+                            "heap_size": len(heap),
+                            "dedup_size": len(seen_keys),
+                            "dropped_empty": stats.dropped_empty,
+                            "dropped_length": stats.dropped_length,
+                            "dropped_char_run": stats.dropped_char_run,
+                            "dropped_repetition": stats.dropped_repetition,
+                            "dropped_dedup": stats.dropped_dedup,
+                            "dropped_other": stats.dropped_other,
+                            "elapsed_min": round(total_dt / 60.0, 2),
+                            "rows_per_sec": None if rows_per_s is None else round(rows_per_s, 2),
+                        }
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            last_t = now
 
     # Finalize samples: sort by score descending for stable output
     heap.sort(key=lambda x: x[0], reverse=True)

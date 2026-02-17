@@ -74,6 +74,39 @@ drive.mount('/content/drive')
 
 ## 4) 一键跑通（建议按顺序）
 
+### 4.0 长时间任务：计时 + 日志 + 后台进度（推荐用法）
+
+Colab 同一个 runtime 通常一次只能跑一个 cell。为了避免“看起来卡住”、以及方便中途查看进度，建议：
+
+- **前台跑（推荐）**：带计时，并把输出同步保存到日志文件
+
+```bash
+# 训练（示例）
+!mkdir -p artifacts/training_logs
+!time python scripts/run_llamafactory_train.py --config configs/qwen2_5_0_5b_sft_full.yaml 2>&1 | tee artifacts/training_logs/train_console.log
+
+# base 评测（示例）
+!mkdir -p artifacts/eval/base
+!time python eval/run_lm_eval.py --model_pretrained "Qwen/Qwen2.5-0.5B" --out_dir artifacts/eval/base --device cuda:0 --batch_size 4 2>&1 | tee artifacts/eval/base/eval_console.log
+
+# sft 评测（示例）
+!mkdir -p artifacts/eval/sft
+!time python eval/run_lm_eval.py --model_pretrained "artifacts/saves/qwen2.5-0.5b/full/sft" --out_dir artifacts/eval/sft --device cuda:0 --batch_size 4 2>&1 | tee artifacts/eval/sft/eval_console.log
+```
+
+- **后台跑（可选）**：不占住 cell，你可以用另一个 cell 查看日志/文件大小
+
+```bash
+# 后台启动（示例：base eval）
+!nohup python eval/run_lm_eval.py --model_pretrained "Qwen/Qwen2.5-0.5B" --out_dir artifacts/eval/base --device cuda:0 --batch_size 4 > artifacts/eval/base/eval_console.log 2>&1 &
+
+# 查看进度
+!tail -n 50 artifacts/eval/base/eval_console.log
+!ls -lh artifacts/eval/base | head
+```
+
+> 如果评测 OOM：把 `--batch_size 4` 改成 `1` 或 `2`。
+
 ### 4.1 数据清洗导出（1M → 250k，默认）
 
 ```bash
@@ -89,7 +122,8 @@ drive.mount('/content/drive')
 ### 4.2 训练（full finetune）
 
 ```bash
-!python scripts/run_llamafactory_train.py --config configs/qwen2_5_0_5b_sft_full.yaml
+!mkdir -p artifacts/training_logs
+!time python scripts/run_llamafactory_train.py --config configs/qwen2_5_0_5b_sft_full.yaml 2>&1 | tee artifacts/training_logs/train_console.log
 !ls -la artifacts/training_logs | head
 ```
 
@@ -97,10 +131,12 @@ drive.mount('/content/drive')
 
 ```bash
 # base
-!python eval/run_lm_eval.py --model_pretrained "Qwen/Qwen2.5-0.5B" --out_dir artifacts/eval/base --device cuda:0 --batch_size 4
+!mkdir -p artifacts/eval/base
+!time python eval/run_lm_eval.py --model_pretrained "Qwen/Qwen2.5-0.5B" --out_dir artifacts/eval/base --device cuda:0 --batch_size 4 2>&1 | tee artifacts/eval/base/eval_console.log
 
 # sft（默认输出目录）
-!python eval/run_lm_eval.py --model_pretrained "artifacts/saves/qwen2.5-0.5b/full/sft" --out_dir artifacts/eval/sft --device cuda:0 --batch_size 4
+!mkdir -p artifacts/eval/sft
+!time python eval/run_lm_eval.py --model_pretrained "artifacts/saves/qwen2.5-0.5b/full/sft" --out_dir artifacts/eval/sft --device cuda:0 --batch_size 4 2>&1 | tee artifacts/eval/sft/eval_console.log
 
 # 汇总
 !python eval/summarize_lm_eval.py --base_dir artifacts/eval/base --sft_dir artifacts/eval/sft --out_csv artifacts/eval/summary.csv
